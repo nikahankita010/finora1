@@ -91,8 +91,6 @@ function simulate(
   const simDebts = initSimDebts(debts);
   const allPayoffs: { debtId: string; debtName: string; monthsToPayoff: number; totalInterest: number; totalPaid: number }[] = [];
   let month = 0;
-  let totalExtraApplied = 0;
-
   while (month < MAX_MONTHS) {
     const active = simDebts.filter((d) => d.balance > 0.001);
 
@@ -115,9 +113,10 @@ function simulate(
       debt.totalPaid += payment;
     }
 
-    // Step 2: Calculate freed-up installment from debts paid off this month
+    // Step 2: Freed-up cash = installments of ALL paid-off debts (available every
+    // month, not just the payoff month, since paid-off debts no longer pay their own)
     const freedUp = simDebts
-      .filter((d) => d.balance <= 0.001 && d.payoffMonth === null)
+      .filter((d) => d.balance <= 0.001)
       .reduce((sum, d) => sum + d.installment, 0);
 
     // Mark newly paid-off debts
@@ -145,12 +144,11 @@ function simulate(
       target = stillActive.reduce((max, d) => (d.rate > max.rate ? d : max), stillActive[0]);
     }
 
-    const extraAvailable = extraMonthlyPayment + freedUp + totalExtraApplied;
+    const extraAvailable = Math.max(0, extraMonthlyPayment) + freedUp;
     if (extraAvailable > 0 && target.balance > 0.001) {
       const extraPayment = Math.min(extraAvailable, target.balance);
       target.balance -= extraPayment;
       target.totalPaid += extraPayment;
-      totalExtraApplied = 0; // extra is consumed each month (not cumulative for fixed extra)
 
       // If target paid off, mark it
       if (target.balance <= 0.001 && target.payoffMonth === null) {
