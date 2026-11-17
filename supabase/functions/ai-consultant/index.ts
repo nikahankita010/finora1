@@ -5,7 +5,7 @@
 // per-user daily message limit, and persists all messages to ai_conversations
 // / ai_messages so conversation history is maintained across sessions.
 //
-// Required secret: OPENAI_API_KEY (configured via Supabase dashboard or CLI).
+// Required secret: OPENAI_API_KEY (already configured for this project).
 // If the secret is missing, the function returns a clear error so the frontend
 // can inform the user — it never pretends to work.
 
