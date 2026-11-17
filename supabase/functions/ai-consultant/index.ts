@@ -60,6 +60,7 @@ Deno.serve(async (req: Request) => {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
 
+
   if (req.method !== "POST") {
     return new Response(
       JSON.stringify({ error: "Metode tidak didukung" }),
@@ -242,27 +243,55 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const aiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${openaiKey}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages,
-        max_tokens: 800,
-        temperature: 0.7,
-      }),
-    });
+    const callOpenAI = () =>
+      fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${openaiKey}`,
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages,
+          max_tokens: 800,
+          temperature: 0.7,
+        }),
+      });
+
+    // Retry once on transient failures (rate limit / provider 5xx)
+    let aiResponse = await callOpenAI();
+    if (!aiResponse.ok && (aiResponse.status === 429 || aiResponse.status >= 500)) {
+      await new Promise((r) => setTimeout(r, 1500));
+      aiResponse = await callOpenAI();
+    }
 
     if (!aiResponse.ok) {
       const errorText = await aiResponse.text();
       console.error("AI API error:", aiResponse.status, errorText);
 
+      let errCode = "";
+      try {
+        errCode = JSON.parse(errorText)?.error?.code ?? "";
+      } catch {
+        // non-JSON error body
+      }
+
+      // Key invalid or out of quota — retrying will not help, flag as unavailable
+      if (aiResponse.status === 401 || errCode === "insufficient_quota" || errCode === "credit_balance_exhausted") {
+        return new Response(
+          JSON.stringify({
+            error:
+              "Layanan AI sedang tidak tersedia karena masalah konfigurasi atau kuota. Silakan hubungi administrator.",
+            conversationId: convId,
+            aiUnavailable: true,
+          }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
       const errorMsg =
         aiResponse.status === 429
-          ? "Layanan AI saat ini sibuk. Silakan coba lagi dalam beberapa saat."
+          ? "Layanan AI sedang sibuk. Silakan coba lagi dalam beberapa saat."
           : "Terjadi kesalahan saat menghubungi layanan AI. Silakan coba lagi.";
 
       return new Response(
