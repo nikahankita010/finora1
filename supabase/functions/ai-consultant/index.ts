@@ -10,6 +10,10 @@
 // can inform the user — it never pretends to work.
 
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+import { chatViaProvider } from "../_shared/ai/providerRegistry.ts";
+import { AiProviderError } from "../_shared/ai/errors.ts";
+import { getModelForTask } from "../_shared/ai/modelRegistry.ts";
+import type { AiMessage } from "../_shared/ai/types.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -210,100 +214,33 @@ Deno.serve(async (req: Request) => {
       messages.push({ role: msg.role, content: msg.content });
     }
 
-    // ─── 8. Call AI API ────────────────────────────────────────
-    const openaiKey = Deno.env.get("OPENAI_API_KEY");
+    // ─── 8. Call AI via the Finora AI Hub provider registry ────
+    const modelEntry = getModelForTask("consultant-chat");
+    const aiRequest = {
+      providerId: modelEntry.providerId,
+      model: modelEntry.modelId,
+      messages: messages as AiMessage[],
+      maxOutputTokens: modelEntry.maxOutputTokens,
+      temperature: 0.7,
+    };
 
-    if (!openaiKey) {
-      // AI key not configured — save a fallback assistant message and return clear error
-      const fallbackMsg =
-        "Maaf, layanan Konsultan AI belum dikonfigurasi. Silakan hubungi administrator untuk mengaktifkan fitur ini.";
-
-      await adminClient
-        .from("ai_messages")
-        .insert({
-          conversation_id: convId,
-          user_id: user.id,
-          role: "assistant",
-          content: fallbackMsg,
-        });
-
-      // Update conversation timestamp
-      await adminClient
-        .from("ai_conversations")
-        .update({ updated_at: new Date().toISOString() })
-        .eq("id", convId);
-
-      return new Response(
-        JSON.stringify({
-          reply: fallbackMsg,
-          conversationId: convId,
-          aiUnavailable: true,
-        }),
-        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    const callOpenAI = () =>
-      fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${openaiKey}`,
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          messages,
-          max_tokens: 800,
-          temperature: 0.7,
-        }),
-      });
-
-    // Retry once on transient failures (rate limit / provider 5xx)
-    let aiResponse = await callOpenAI();
-    if (!aiResponse.ok && (aiResponse.status === 429 || aiResponse.status >= 500)) {
-      await new Promise((r) => setTimeout(r, 1500));
-      aiResponse = await callOpenAI();
-    }
-
-    if (!aiResponse.ok) {
-      const errorText = await aiResponse.text();
-      console.error("AI API error:", aiResponse.status, errorText);
-
-      let errCode = "";
-      try {
-        errCode = JSON.parse(errorText)?.error?.code ?? "";
-      } catch {
-        // non-JSON error body
+    // Retry once on transient provider failures (throttling, 5xx, timeout)
+    let aiResult;
+    try {
+      aiResult = await chatViaProvider(aiRequest);
+    } catch (err) {
+      if (err instanceof AiProviderError && err.retryable) {
+        await new Promise((r) => setTimeout(r, 1500));
+        aiResult = await chatViaProvider(aiRequest);
+      } else {
+        throw err;
       }
-
-      // Key invalid or out of quota — retrying will not help, flag as unavailable
-      if (aiResponse.status === 401 || errCode === "insufficient_quota" || errCode === "credit_balance_exhausted") {
-        return new Response(
-          JSON.stringify({
-            error:
-              "Layanan AI sedang tidak tersedia karena masalah konfigurasi atau kuota. Silakan hubungi administrator.",
-            conversationId: convId,
-            aiUnavailable: true,
-          }),
-          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-
-      const errorMsg =
-        aiResponse.status === 429
-          ? "Layanan AI sedang sibuk. Silakan coba lagi dalam beberapa saat."
-          : "Terjadi kesalahan saat menghubungi layanan AI. Silakan coba lagi.";
-
-      return new Response(
-        JSON.stringify({ error: errorMsg, conversationId: convId }),
-        { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
     }
 
-    const aiData = await aiResponse.json();
-    const reply =
-      aiData?.choices?.[0]?.message?.content ??
-      "Maaf, saya tidak dapat memberikan respons saat ini. Silakan coba lagi.";
+    // Map provider errors to user-facing messages (unchanged contract)
+    if (aiResult instanceof AiProviderError) throw aiResult;
+
+    const reply = aiResult.text;
 
     // ─── 9. Save assistant message ─────────────────────────────
     await adminClient
@@ -326,6 +263,33 @@ Deno.serve(async (req: Request) => {
       { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (err) {
+    // Provider failures get specific, honest user messages — no secrets,
+    // no provider details beyond what the user needs to act on.
+    if (err instanceof AiProviderError) {
+      console.error(`AI provider error (${err.code}):`, err.message);
+
+      if (err.code === "quota" || err.code === "authentication") {
+        return new Response(
+          JSON.stringify({
+            error:
+              "Layanan AI sedang tidak tersedia karena masalah konfigurasi atau kuota. Silakan hubungi administrator.",
+            aiUnavailable: true,
+          }),
+          { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const errorMsg =
+        err.code === "rate_limit"
+          ? "Layanan AI sedang sibuk. Silakan coba lagi dalam beberapa saat."
+          : "Terjadi kesalahan saat menghubungi layanan AI. Silakan coba lagi.";
+
+      return new Response(
+        JSON.stringify({ error: errorMsg }),
+        { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
     console.error("Edge function error:", err);
     return new Response(
       JSON.stringify({ error: "Terjadi kesalahan sistem. Silakan coba lagi." }),
