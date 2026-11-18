@@ -1,19 +1,22 @@
 // AI Financial Consultant Edge Function
 //
-// Proxies user messages to an AI provider (OpenAI) server-side so the API key
-// never reaches the browser. Authenticates via the Supabase JWT, enforces a
-// per-user daily message limit, and persists all messages to ai_conversations
-// / ai_messages so conversation history is maintained across sessions.
+// Proxies user messages to an AI provider through the Finora AI Hub provider
+// registry so the API key never reaches the browser. Authenticates via the
+// Supabase JWT, enforces a per-user daily message limit, reads the user's
+// financial data directly from Supabase (Financial Context Builder +
+// Financial Engine), and persists all messages to ai_conversations/
+// ai_messages so conversation history is maintained across sessions.
 //
-// Required secret: OPENAI_API_KEY (already configured for this project).
-// If the secret is missing, the function returns a clear error so the frontend
-// can inform the user — it never pretends to work.
+// If the provider secret is missing, or the provider rejects the key / has no
+// quota, the function returns a 502 with aiUnavailable so the frontend can
+// inform the user — it never pretends to work.
 
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 import { chatViaProvider } from "../_shared/ai/providerRegistry.ts";
 import { AiProviderError } from "../_shared/ai/errors.ts";
 import { getModelForTask } from "../_shared/ai/modelRegistry.ts";
-import type { AiMessage } from "../_shared/ai/types.ts";
+import type { AiChatResponse, AiMessage } from "../_shared/ai/types.ts";
+import { buildFinancialContext, formatFinancialContext } from "../_shared/financial/builder.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -35,6 +38,12 @@ PRINSIP KERJA:
 8. Ketika membandingkan skenario keuangan (misalnya dua strategi pelunasan utang atau dua pilihan anggaran), gunakan HANYA angka yang telah diverifikasi — yakni angka yang diberikan pengguna atau data profil yang disertakan. Jangan mengarang angka perbandingan. Tampilkan perbandingan dalam struktur yang jelas (tabel atau daftar bersisian) dan jelaskan konsekuensi logis dari masing-masing skenario berdasarkan angka tersebut.
 9. Jelaskan masalah keuangan dengan bahasa sederhana sebelum memberikan solusi. Pastikan pengguna memahami akar masalahnya terlebih dahulu.
 
+DATA KEUANGAN PENGGUNA:
+- Jika konteks data keuangan disertakan, itu adalah data NYATA yang dibaca langsung dari database Finora. Gunakan angka tersebut apa adanya — JANGAN menghitung ulang, JANGAN mengarang angka baru.
+- Nilai "BELUM TERSEDIO (not_provided)" berarti data belum pernah diisi. Data yang belum tersedia BUKAN bernilai nol. JANGAN pernah menyimpulkan bahwa pendapatan, tabungan, utang, atau pengeluaran pengguna bernilai 0 hanya karena datanya tidak ada.
+- JANGAN memberikan kesimpulan kesehatan keuangan (sehat/bermasalah) jika data belum mencukupi. Ajukan pertanyaan klarifikasi atau sarankan pengguna mengisi fitur Analisis Keuangan terlebih dahulu.
+- Jika pengguna menyebutkan angka sendiri dalam pesan, gunakan angka tersebut untuk diskusi, tetapi tetap arahkan perhitungan resmi ke fitur Analisis Keuangan.
+
 FORMAT JAWABAN:
 - Gunakan paragraf singkat dan jelas.
 - Untuk langkah-langkah, gunakan penomoran.
@@ -45,18 +54,9 @@ FORMAT JAWABAN:
 interface ChatRequest {
   message: string;
   conversationId?: string;
+  /** Consent flag: when true, the backend attaches the user's verified
+   *  financial context (read server-side from Supabase). */
   includeProfile?: boolean;
-  profileData?: {
-    monthlyIncome: number;
-    essentialExpenses: number;
-    nonEssentialExpenses: number;
-    debtBalances: number;
-    monthlyInstallments: number;
-    savings: number;
-    financialDependents: number;
-    emergencyFund: number;
-    recentTransactions?: { description: string; amount: number; type: string; category: string }[];
-  };
 }
 
 Deno.serve(async (req: Request) => {
@@ -121,7 +121,7 @@ Deno.serve(async (req: Request) => {
 
     // ─── 3. Parse request body ─────────────────────────────────
     const body: ChatRequest = await req.json();
-    const { message, conversationId, includeProfile, profileData } = body;
+    const { message, conversationId, includeProfile } = body;
 
     if (!message || !message.trim()) {
       return new Response(
@@ -186,27 +186,12 @@ Deno.serve(async (req: Request) => {
       { role: "system", content: SYSTEM_PROMPT },
     ];
 
-    // If user consented to share profile data, append as context
-    if (includeProfile && profileData) {
-      let profileContext = `\n\nDATA PROFIL KEUANGAN PENGGUNA (dengan persetujuan eksplisit):\n`;
-      profileContext += `- Pendapatan Bulanan: Rp ${profileData.monthlyIncome.toLocaleString("id-ID")}\n`;
-      profileContext += `- Pengeluaran Wajib: Rp ${profileData.essentialExpenses.toLocaleString("id-ID")}\n`;
-      profileContext += `- Pengeluaran Non-Wajib: Rp ${profileData.nonEssentialExpenses.toLocaleString("id-ID")}\n`;
-      profileContext += `- Total Saldo Utang: Rp ${profileData.debtBalances.toLocaleString("id-ID")}\n`;
-      profileContext += `- Cicilan Bulanan: Rp ${profileData.monthlyInstallments.toLocaleString("id-ID")}\n`;
-      profileContext += `- Total Tabungan: Rp ${profileData.savings.toLocaleString("id-ID")}\n`;
-      profileContext += `- Jumlah Tanggungan: ${profileData.financialDependents} orang\n`;
-      profileContext += `- Dana Darurat: Rp ${profileData.emergencyFund.toLocaleString("id-ID")}\n`;
-
-      if (profileData.recentTransactions && profileData.recentTransactions.length > 0) {
-        profileContext += `\nTRANSAKSI TERBARU:\n`;
-        for (const tx of profileData.recentTransactions.slice(0, 10)) {
-          profileContext += `- ${tx.description} | ${tx.type === "income" ? "Pemasukan" : "Pengeluaran"} | ${tx.category} | Rp ${tx.amount.toLocaleString("id-ID")}\n`;
-        }
-      }
-
-      profileContext += `\nGunakan data ini untuk memberikan jawaban yang lebih personal. Jangan menghitung ulang angka ini — gunakan apa adanya.`;
-      messages.push({ role: "system", content: profileContext });
+    // If user consented, read their verified financial data server-side and
+    // run it through the Financial Engine. Frontend-supplied numbers are
+    // never used as an analysis source.
+    if (includeProfile) {
+      const financialContext = await buildFinancialContext(adminClient, user.id);
+      messages.push({ role: "system", content: formatFinancialContext(financialContext) });
     }
 
     // Append conversation history
@@ -225,7 +210,7 @@ Deno.serve(async (req: Request) => {
     };
 
     // Retry once on transient provider failures (throttling, 5xx, timeout)
-    let aiResult;
+    let aiResult: AiChatResponse;
     try {
       aiResult = await chatViaProvider(aiRequest);
     } catch (err) {
@@ -236,9 +221,6 @@ Deno.serve(async (req: Request) => {
         throw err;
       }
     }
-
-    // Map provider errors to user-facing messages (unchanged contract)
-    if (aiResult instanceof AiProviderError) throw aiResult;
 
     const reply = aiResult.text;
 

@@ -14,8 +14,6 @@ import {
 } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
 import { useAIConsultant, type ChatMessage } from '@/hooks/useAIConsultant';
-import { useTransactions } from '@/hooks/useTransactions';
-import { useAssessments, toInput } from '@/hooks/useAssessments';
 import { formatIDR } from '@/utils/format';
 
 const SUGGESTED_QUESTIONS = [
@@ -43,9 +41,6 @@ export default function AIConsultantPage() {
     clearError,
   } = useAIConsultant();
 
-  const { transactions } = useTransactions();
-  const { assessments } = useAssessments();
-
   const [input, setInput] = useState('');
   const [includeProfile, setIncludeProfile] = useState(false);
   const [showSidebar, setShowSidebar] = useState(false);
@@ -70,47 +65,6 @@ export default function AIConsultantPage() {
     el.style.height = Math.min(el.scrollHeight, 120) + 'px';
   };
 
-  const buildProfileData = useCallback(() => {
-    if (!includeProfile) return undefined;
-
-    const latestAssessment = assessments[0];
-    const assessmentInput = latestAssessment ? toInput(latestAssessment) : null;
-
-    const recentTx = transactions.slice(0, 10).map((t) => ({
-      description: t.description,
-      amount: Number(t.amount),
-      type: t.type,
-      category: t.category,
-    }));
-
-    if (!assessmentInput) {
-      // Only send transaction data if no assessment exists
-      return {
-        monthlyIncome: 0,
-        essentialExpenses: 0,
-        nonEssentialExpenses: 0,
-        debtBalances: 0,
-        monthlyInstallments: 0,
-        savings: 0,
-        financialDependents: 0,
-        emergencyFund: 0,
-        recentTransactions: recentTx,
-      };
-    }
-
-    return {
-      monthlyIncome: assessmentInput.monthlyIncome,
-      essentialExpenses: assessmentInput.essentialExpenses,
-      nonEssentialExpenses: assessmentInput.nonEssentialExpenses,
-      debtBalances: assessmentInput.debtBalances,
-      monthlyInstallments: assessmentInput.monthlyInstallments,
-      savings: assessmentInput.savings,
-      financialDependents: assessmentInput.financialDependents,
-      emergencyFund: assessmentInput.emergencyFund,
-      recentTransactions: recentTx,
-    };
-  }, [includeProfile, assessments, transactions]);
-
   const handleSend = async (messageText?: string) => {
     const text = (messageText ?? input).trim();
     if (!text || sending) return;
@@ -122,7 +76,6 @@ export default function AIConsultantPage() {
       message: text,
       conversationId: activeConversationId ?? undefined,
       includeProfile,
-      profileData: buildProfileData(),
       session,
     });
   };

@@ -1,7 +1,6 @@
 import { useState, useCallback, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
 import type { Session } from '@supabase/supabase-js';
-import type { Transaction } from '@/types/transaction';
 
 export interface ChatMessage {
   id: string;
@@ -21,17 +20,6 @@ interface SendOptions {
   message: string;
   conversationId?: string;
   includeProfile: boolean;
-  profileData?: {
-    monthlyIncome: number;
-    essentialExpenses: number;
-    nonEssentialExpenses: number;
-    debtBalances: number;
-    monthlyInstallments: number;
-    savings: number;
-    financialDependents: number;
-    emergencyFund: number;
-    recentTransactions?: Pick<Transaction, 'description' | 'amount' | 'type' | 'category'>[];
-  };
   session: Session | null;
 }
 
@@ -120,7 +108,6 @@ export function useAIConsultant() {
           message: opts.message,
           conversationId: opts.conversationId,
           includeProfile: opts.includeProfile,
-          profileData: opts.includeProfile ? opts.profileData : undefined,
         }),
       });
 
