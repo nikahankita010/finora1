@@ -2,8 +2,8 @@
   "projectId": "73008505",
   "functions": {
     "ai-consultant": {
-      "hasChanged": true,
-      "hash": "a1d46a24475373c84b5f73c383cbeaca87eac964b6dcc8bd169fac36f2c5bcd9763b21276e8b0f15994c1e56299ebb2fe80424ea75da9ab4464a1c96f6e0c60d"
+      "hasChanged": false,
+      "hash": "a1d46a24475373c84b5f73c383cbeaca87eac964b6dcc8bd169fac36f2c5bcd92609e369930fb65740c705ccefd58ce979c5057e8c99606dcba0838103f52644"
     }
   }
 }

@@ -4,7 +4,7 @@
 // Supabase and hands to the AI. Core rule: data that is not yet available is
 // NEVER represented as zero — it is marked not_provided / insufficient_data.
 
-import type { AssessmentMetrics } from "../../../src/lib/financialCalculations.ts";
+import type { AssessmentMetrics } from "./financialCalculations.ts";
 
 export type DataSufficiency = "sufficient" | "partial" | "insufficient";
 

@@ -14,8 +14,8 @@
 //   - goalCalculations.ts (goal progress and required contributions)
 
 import type { SupabaseClient } from "npm:@supabase/supabase-js@2.57.4";
-import { calculateAllMetrics } from "../../../src/lib/financialCalculations.ts";
-import { calculateGoalMetrics } from "../../../src/lib/goalCalculations.ts";
+import { calculateAllMetrics } from "./financialCalculations.ts";
+import { calculateGoalMetrics } from "./goalCalculations.ts";
 import type {
   FinancialContext,
   TransactionsContext,
