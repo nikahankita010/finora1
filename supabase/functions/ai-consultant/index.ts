@@ -1,20 +1,21 @@
 // AI Financial Consultant Edge Function
 //
-// Proxies user messages to an AI provider through the Finora AI Hub provider
-// registry so the API key never reaches the browser. Authenticates via the
-// Supabase JWT, enforces a per-user daily message limit, reads the user's
-// financial data directly from Supabase (Financial Context Builder +
-// Financial Engine), and persists all messages to ai_conversations/
-// ai_messages so conversation history is maintained across sessions.
+// Proxies user messages to an AI provider chosen automatically by the Finora
+// AI Hub router: the router classifies the question, picks the best available
+// model (secret configured + adapter registered), and falls back to the next
+// candidate on transient failures. API keys never reach the browser.
+// Authenticates via the Supabase JWT, enforces a per-user daily message
+// limit, reads the user's financial data directly from Supabase (Financial
+// Context Builder + Financial Engine), and persists all messages to
+// ai_conversations/ai_messages so conversation history is maintained.
 //
-// If the provider secret is missing, or the provider rejects the key / has no
-// quota, the function returns a 502 with aiUnavailable so the frontend can
-// inform the user — it never pretends to work.
+// If no provider secret is configured, or every provider fails, the function
+// returns a 502 with aiUnavailable so the frontend can inform the user — it
+// never pretends to work.
 
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
-import { chatViaProvider } from "../_shared/ai/providerRegistry.ts";
 import { AiProviderError } from "../_shared/ai/errors.ts";
-import { getModelForTask } from "../_shared/ai/modelRegistry.ts";
+import { chatWithRouting } from "../_shared/ai/router.ts";
 import type { AiChatResponse, AiMessage } from "../_shared/ai/types.ts";
 import { buildFinancialContext, formatFinancialContext } from "../_shared/financial/builder.ts";
 
@@ -199,27 +200,31 @@ Deno.serve(async (req: Request) => {
       messages.push({ role: msg.role, content: msg.content });
     }
 
-    // ─── 8. Call AI via the Finora AI Hub provider registry ────
-    const modelEntry = getModelForTask("consultant-chat");
-    const aiRequest = {
-      providerId: modelEntry.providerId,
-      model: modelEntry.modelId,
-      messages: messages as AiMessage[],
-      maxOutputTokens: modelEntry.maxOutputTokens,
-      temperature: 0.7,
+    // ─── 8. Call AI via the router: classify → route → fallback ─
+    // Collect which provider secrets exist so the router only considers
+    // providers that are actually configured. Keys themselves stay in env —
+    // only their presence is recorded here.
+    const providerSecrets: Record<string, string | undefined> = {
+      openai: Deno.env.get("OPENAI_API_KEY"),
+      gemini: Deno.env.get("GEMINI_API_KEY"),
+      anthropic: Deno.env.get("ANTHROPIC_API_KEY"),
+      groq: Deno.env.get("GROQ_API_KEY"),
+      openrouter: Deno.env.get("OPENROUTER_API_KEY"),
+      deepseek: Deno.env.get("DEEPSEEK_API_KEY"),
+      mistral: Deno.env.get("MISTRAL_API_KEY"),
     };
 
-    // Retry once on transient provider failures (throttling, 5xx, timeout)
-    let aiResult: AiChatResponse;
-    try {
-      aiResult = await chatViaProvider(aiRequest);
-    } catch (err) {
-      if (err instanceof AiProviderError && err.retryable) {
-        await new Promise((r) => setTimeout(r, 1500));
-        aiResult = await chatViaProvider(aiRequest);
-      } else {
-        throw err;
-      }
+    const aiResult: AiChatResponse & { fallbackTrail: string[] } =
+      await chatWithRouting({
+        message,
+        secrets: providerSecrets,
+        messages: messages as AiMessage[],
+        maxOutputTokens: 1200,
+        temperature: 0.7,
+      });
+
+    if (aiResult.fallbackTrail.length > 0) {
+      console.warn(`AI router fallback trail: ${aiResult.fallbackTrail.join(" -> ")}`);
     }
 
     const reply = aiResult.text;
