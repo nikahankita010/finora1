@@ -60,6 +60,58 @@ interface ChatRequest {
   includeProfile?: boolean;
 }
 
+const MAX_MESSAGE_LENGTH = 5_000;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function badRequest(error: string, status = 400): Response {
+  return new Response(JSON.stringify({ error }), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+/** Validate the parsed request body. Returns an error response or null. */
+function validateChatRequest(body: unknown): { body: ChatRequest; error: Response } | {
+  body: ChatRequest;
+  error: null;
+} {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return { body: {} as ChatRequest, error: badRequest("Format permintaan tidak valid") };
+  }
+  const raw = body as Record<string, unknown>;
+
+  if (typeof raw.message !== "string" || raw.message.trim().length === 0) {
+    return { body: {} as ChatRequest, error: badRequest("Pesan tidak boleh kosong") };
+  }
+  if (raw.message.length > MAX_MESSAGE_LENGTH) {
+    return {
+      body: {} as ChatRequest,
+      error: badRequest(`Pesan terlalu panjang. Maksimal ${MAX_MESSAGE_LENGTH} karakter.`),
+    };
+  }
+
+  let conversationId: string | undefined;
+  if (raw.conversationId !== undefined && raw.conversationId !== null) {
+    if (typeof raw.conversationId !== "string" || !UUID_RE.test(raw.conversationId)) {
+      return { body: {} as ChatRequest, error: badRequest("conversationId tidak valid") };
+    }
+    conversationId = raw.conversationId;
+  }
+
+  let includeProfile = false;
+  if (raw.includeProfile !== undefined) {
+    if (typeof raw.includeProfile !== "boolean") {
+      return { body: {} as ChatRequest, error: badRequest("includeProfile harus berupa boolean") };
+    }
+    includeProfile = raw.includeProfile;
+  }
+
+  return {
+    body: { message: raw.message, conversationId, includeProfile },
+    error: null,
+  };
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -120,16 +172,17 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // ─── 3. Parse request body ─────────────────────────────────
-    const body: ChatRequest = await req.json();
-    const { message, conversationId, includeProfile } = body;
-
-    if (!message || !message.trim()) {
-      return new Response(
-        JSON.stringify({ error: "Pesan tidak boleh kosong" }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+    // ─── 3. Parse and validate request body ────────────────────
+    let rawBody: unknown;
+    try {
+      rawBody = await req.json();
+    } catch {
+      return badRequest("Body permintaan harus berupa JSON yang valid");
     }
+
+    const { body: chatRequest, error: validationError } = validateChatRequest(rawBody);
+    if (validationError) return validationError;
+    const { message, conversationId, includeProfile } = chatRequest;
 
     // ─── 4. Get or create conversation ─────────────────────────
     let convId = conversationId;
@@ -149,23 +202,26 @@ Deno.serve(async (req: Request) => {
       }
       convId = newConv.id;
     } else {
-      // Verify ownership
-      const { data: conv } = await adminClient
+      // Verify ownership (RLS-independent: admin client reads the row, then
+      // the user_id is compared against the verified caller explicitly)
+      const { data: conv, error: convFetchError } = await adminClient
         .from("ai_conversations")
         .select("id, user_id")
         .eq("id", convId)
         .maybeSingle();
 
+      if (convFetchError) {
+        console.error("Conversation lookup failed:", convFetchError.message);
+        return badRequest("Gagal memeriksa percakapan", 500);
+      }
+
       if (!conv || conv.user_id !== user.id) {
-        return new Response(
-          JSON.stringify({ error: "Percakapan tidak ditemukan" }),
-          { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
+        return badRequest("Percakapan tidak ditemukan", 404);
       }
     }
 
     // ─── 5. Save user message ──────────────────────────────────
-    await adminClient
+    const { error: userMsgError } = await adminClient
       .from("ai_messages")
       .insert({
         conversation_id: convId,
@@ -173,14 +229,27 @@ Deno.serve(async (req: Request) => {
         role: "user",
         content: message.trim(),
       });
+    if (userMsgError) {
+      console.error("Failed to save user message:", userMsgError.message);
+      return badRequest("Gagal menyimpan pesan. Silakan coba lagi.", 500);
+    }
 
     // ─── 6. Fetch conversation history (last 20 messages) ──────
-    const { data: history } = await adminClient
+    // Filtered by user_id so history can never span another user's rows
+    const { data: history, error: historyError } = await adminClient
       .from("ai_messages")
       .select("role, content")
       .eq("conversation_id", convId)
-      .order("created_at", { ascending: true })
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false })
       .limit(20);
+
+    if (historyError) {
+      console.error("Failed to fetch history:", historyError.message);
+      return badRequest("Gagal memuat riwayat percakapan. Silakan coba lagi.", 500);
+    }
+    // Oldest-first for the AI conversation flow
+    const orderedHistory = (history ?? []).slice().reverse();
 
     // ─── 7. Build messages array for AI API ────────────────────
     const messages: { role: string; content: string }[] = [
@@ -195,8 +264,8 @@ Deno.serve(async (req: Request) => {
       messages.push({ role: "system", content: formatFinancialContext(financialContext) });
     }
 
-    // Append conversation history
-    for (const msg of history ?? []) {
+    // Append conversation history (oldest first)
+    for (const msg of orderedHistory) {
       messages.push({ role: msg.role, content: msg.content });
     }
 
@@ -230,7 +299,7 @@ Deno.serve(async (req: Request) => {
     const reply = aiResult.text;
 
     // ─── 9. Save assistant message ─────────────────────────────
-    await adminClient
+    const { error: assistantMsgError } = await adminClient
       .from("ai_messages")
       .insert({
         conversation_id: convId,
@@ -238,12 +307,24 @@ Deno.serve(async (req: Request) => {
         role: "assistant",
         content: reply,
       });
+    if (assistantMsgError) {
+      console.error("Failed to save assistant message:", assistantMsgError.message);
+      // Reply is still returned so the user keeps it, but the failure is
+      // signalled: the persisted history will be missing this turn.
+      return new Response(
+        JSON.stringify({ reply, conversationId: convId, persisted: false }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
 
     // Update conversation timestamp
-    await adminClient
+    const { error: convUpdateError } = await adminClient
       .from("ai_conversations")
       .update({ updated_at: new Date().toISOString() })
       .eq("id", convId);
+    if (convUpdateError) {
+      console.error("Failed to update conversation timestamp:", convUpdateError.message);
+    }
 
     return new Response(
       JSON.stringify({ reply, conversationId: convId }),
