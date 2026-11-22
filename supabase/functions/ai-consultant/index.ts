@@ -26,8 +26,6 @@ const corsHeaders = {
 };
 
 const MAX_DAILY_MESSAGES = 30;
-const BURST_LIMIT_PER_MINUTE = 5;
-const BURST_WINDOW_SECONDS = 60;
 const SYSTEM_PROMPT = `Anda adalah Konsultan Keuangan AI Finora — asisten keuangan pribadi yang membantu pengguna berbahasa Indonesia.
 
 PRINSIP KERJA:
@@ -157,69 +155,18 @@ Deno.serve(async (req: Request) => {
     // Service role client for DB operations (bypasses RLS)
     const adminClient = createClient(supabaseUrl, serviceRoleKey);
 
-    // ─── 2. Rate limiting: atomic daily quota + burst check ────
-    // Single RPC that checks AND reserves quota under a row lock, so
-    // concurrent requests cannot slip past the limit. Runs BEFORE any
-    // provider call and before the message is saved — rejected requests
-    // never reach an AI provider and never consume provider credits.
-    // Fail-closed: an RPC failure denies the request.
-    const { data: limitResult, error: limitError } = await adminClient.rpc(
-      "check_ai_rate_limit",
-      {
-        p_user_id: user.id,
-        p_daily_limit: MAX_DAILY_MESSAGES,
-        p_burst_limit: BURST_LIMIT_PER_MINUTE,
-        p_burst_window_seconds: BURST_WINDOW_SECONDS,
-      }
-    );
+    // ─── 2. Rate limiting: count messages today ────────────────
+    const today = new Date().toISOString().split("T")[0];
+    const { count: todayCount } = await adminClient
+      .from("ai_messages")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", user.id)
+      .gte("created_at", `${today}T00:00:00Z`);
 
-    if (limitError) {
-      // Fail-closed: never forward an unrated request to a provider.
-      console.error("Rate limiter RPC failed:", limitError.message);
+    if ((todayCount ?? 0) >= MAX_DAILY_MESSAGES) {
       return new Response(
         JSON.stringify({
-          error: "RATE_LIMIT_UNAVAILABLE",
-          message: "Sistem penggunaan AI sedang tidak tersedia. Silakan coba lagi nanti.",
-        }),
-        { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    const limit = limitResult as {
-      allowed: boolean;
-      reason: string | null;
-      daily_used: number;
-      daily_limit: number;
-      burst_count: number;
-      burst_limit: number;
-      retry_after_seconds: number | null;
-    };
-
-    if (!limit.allowed) {
-      if (limit.reason === "burst_limit") {
-        const waitSec = limit.retry_after_seconds ?? BURST_WINDOW_SECONDS;
-        return new Response(
-          JSON.stringify({
-            error: "BURST_LIMIT_REACHED",
-            message: `Anda mengirim pesan terlalu cepat. Tunggu ${waitSec} detik lalu coba lagi.`,
-            remaining: Math.max(0, limit.daily_limit - limit.daily_used),
-          }),
-          {
-            status: 429,
-            headers: {
-              ...corsHeaders,
-              "Content-Type": "application/json",
-              "Retry-After": String(waitSec),
-            },
-          }
-        );
-      }
-
-      return new Response(
-        JSON.stringify({
-          error: "DAILY_LIMIT_REACHED",
-          message: `Batas penggunaan AI harian Anda telah tercapai (${limit.daily_used}/${limit.daily_limit} pesan). Coba lagi besok.`,
-          remaining: 0,
+          error: `Batas harian tercapai. Anda telah mengirim ${MAX_DAILY_MESSAGES} pesan hari ini. Coba lagi besok.`,
         }),
         { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
@@ -378,21 +325,6 @@ Deno.serve(async (req: Request) => {
     if (convUpdateError) {
       console.error("Failed to update conversation timestamp:", convUpdateError.message);
     }
-
-    // Server-side usage log: user id, timestamp, outcome, provider/model.
-    // Never logs keys, tokens, or message content.
-    console.log(
-      JSON.stringify({
-        event: "ai_request_completed",
-        userId: user.id,
-        at: new Date().toISOString(),
-        provider: aiResult.providerId,
-        model: aiResult.modelId ?? aiResult.model,
-        latencyMs: aiResult.latencyMs,
-        dailyUsed: limit.daily_used,
-        fallbackCount: aiResult.fallbackTrail.length,
-      })
-    );
 
     return new Response(
       JSON.stringify({ reply, conversationId: convId }),
